@@ -10,6 +10,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { KinematicCharacterController } from "@dimforge/rapier3d-compat";
+import { useGamepadStore } from "./stores/useGamePad";
 
 export default function Ostrich() {
   const ostrich = useGLTF("./nla_ostrich.glb");
@@ -20,142 +21,213 @@ export default function Ostrich() {
   const [smoothedCameraTarget] = useState(() => new THREE.Vector3());
 
   const [subscribeKeys, getKeys] = useKeyboardControls();
-
-  // https://codesandbox.io/embed/rapier-character-controller-043f02
   const rapier = useRapier();
-  const controller = useRef(); /// kinematiccharactercontroller
-  const collider = useRef(); // rapier collider
-  const body = useRef(); // rapier rigid body
+  const controller = useRef();
+  const collider = useRef();
+  const body = useRef();
   const ostrichRef = useRef();
 
-  // animation
+  // Animation state
   const currentAnimation = useRef("idle-1");
-  const animationTime = useRef(null);
+  const currentSpeed = useRef(0);
+  const targetSpeed = useRef(0);
+
+  // Movement thresholds
+  const DEADZONE = 0.1;
+  const WALK_THRESHOLD = 0.4;
+  const RUN_THRESHOLD = 0.8;
+
+  // Speed configurations
+  const WALK_SPEED = 0.05;
+  const RUN_SPEED = 0.15;
 
   const transitionMap = {
     "idle-1": {
-      walk: { fadeOut: 0.3, fadeIn: 0.5 }, // Slow rise to walk
-      run: { fadeOut: 0.2, fadeIn: 0.5 }, // Even slower rise to run
+      walk: { fadeOut: 0.3, fadeIn: 0.5 },
+      run: { fadeOut: 0.2, fadeIn: 0.5 },
+      "attack-1": { fadeOut: 0.5, fadeIn: 0.2 },
     },
     walk: {
-      "idle-1": { fadeOut: 0.5, fadeIn: 0.3 }, // Quick drop to 'idle-1'
-      run: { fadeOut: 0.3, fadeIn: 0.4 }, // Gradual rise to run
+      "idle-1": { fadeOut: 0.5, fadeIn: 0.3 },
+      run: { fadeOut: 0.3, fadeIn: 0.4 },
+      "attack-1": { fadeOut: 0.5, fadeIn: 0.2 },
     },
     run: {
-      "idle-1": { fadeOut: 0.5, fadeIn: 0.2 }, // Very quick drop to idle
-      walk: { fadeOut: 0.5, fadeIn: 0.3 }, // Quick drop to walk
+      "idle-1": { fadeOut: 0.5, fadeIn: 0.2 },
+      walk: { fadeOut: 0.5, fadeIn: 0.3 },
+      "attack-1": { fadeOut: 0.5, fadeIn: 0.2 },
+    },
+    "attack-1": {
+      "idle-1": { fadeOut: 0.5, fadeIn: 0.1 },
+      walk: { fadeOut: 0.5, fadeIn: 0.3 },
+      run: { fadeOut: 0.3, fadeIn: 0.4 },
     },
   };
 
-  function transitionTo(newAnimation) {
+  function transitionTo(newAnimation, blendWeight = 1) {
     const current = currentAnimation.current;
-    if (newAnimation === current) return;
+    if (newAnimation === current) {
+      // Update weight of current animation
+      animations.actions[current].setEffectiveWeight(blendWeight);
+      return;
+    }
 
     const transition = transitionMap[current][newAnimation];
-    // Fade out current with its duration
+
+    // Fade out current animation
     animations.actions[current].fadeOut(transition.fadeOut);
 
-    // Fade in new with its duration
+    // Fade in new animation with specified weight
     animations.actions[newAnimation].reset();
     animations.actions[newAnimation].fadeIn(transition.fadeIn);
+    animations.actions[newAnimation].setEffectiveWeight(blendWeight);
     animations.actions[newAnimation].play();
 
     currentAnimation.current = newAnimation;
   }
 
-  function animateFromIdle() {
-    const currentTimeMillis = Date.now();
-    console.log(currentAnimation.current);
-    if (
-      animationTime.current === null &&
-      currentAnimation.current === "idle-1"
-    ) {
-      animationTime.current = Date.now();
-      transitionTo("walk");
-      return;
+  function updateMovementState(intensity) {
+    // Calculate movement speed based on intensity
+    if (intensity <= DEADZONE) {
+      transitionTo("idle-1");
+      targetSpeed.current = 0;
+    } else if (intensity <= WALK_THRESHOLD) {
+      // Map intensity to walk animation weight
+      const walkWeight = (intensity - DEADZONE) / (WALK_THRESHOLD - DEADZONE);
+      transitionTo("walk", walkWeight);
+      targetSpeed.current = WALK_SPEED * walkWeight;
+    } else if (intensity <= RUN_THRESHOLD) {
+      // Blend between walk and run
+      const runProgress =
+        (intensity - WALK_THRESHOLD) / (RUN_THRESHOLD - WALK_THRESHOLD);
+      transitionTo("run", runProgress);
+      targetSpeed.current = WALK_SPEED + (RUN_SPEED - WALK_SPEED) * runProgress;
+    } else {
+      // Full run
+      transitionTo("run");
+      const speedMultiplier =
+        1 + ((intensity - RUN_THRESHOLD) / (1 - RUN_THRESHOLD)) * 0.2; // Up to 20% faster
+      targetSpeed.current = RUN_SPEED * speedMultiplier;
     }
-    if (animationTime.current && currentAnimation.current === "walk") {
-      if (
-        (currentTimeMillis - animationTime.current) / 1000 >
-        transitionMap[currentAnimation.current]["run"].fadeIn // convert to milliseconds
-      ) {
-        transitionTo("run");
-      }
-    }
-  }
-
-  function animateFromRun() {
-    animationTime.current = null;
-    transitionTo("idle-1");
   }
 
   useEffect(() => {
-    // set up character controller
+    // Set up character controller
     const offsetFromGameWorld = 0.01;
     const char = rapier.world.createCharacterController(offsetFromGameWorld);
     char.setApplyImpulsesToDynamicBodies(true);
     char.enableAutostep(5, 0.1, false);
     char.enableSnapToGround(1);
-
     controller.current = char;
 
-    // set up animations
+    // Initialize idle animation
     const idleAction = animations.actions["idle-1"];
-
+    animations.actions["attack-1"].setEffectiveTimeScale(5);
     if (idleAction) {
       idleAction.play();
       idleAction.setEffectiveWeight(1);
     }
-  }, [rapier, animations]);
+
+    // Enable shadows for all meshes in the model
+    ostrich.scene.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        // Optionally, also make sure materials are set up for shadows
+        if (child.material) {
+          child.material.shadowSide = THREE.FrontSide;
+        }
+      }
+    });
+  }, [rapier, animations, ostrich.scene]);
 
   useFrame((state, delta) => {
-    const { forward, backward, leftward, rightward } = getKeys();
-    // OSTRICH MOVEMENT
-    if (controller.current && body.current && collider.current) {
-      try {
-        const position = vec3(body.current.translation());
-        const movement = vec3();
+    const gamepad = navigator.getGamepads()?.[0];
 
-        if (forward) movement.z += 0.1;
-        if (backward) movement.z -= 0.1;
-        if (leftward) movement.x -= 0.1;
-        if (rightward) movement.x += 0.1;
+    if (gamepad) {
+      // ATTACK
+      if (gamepad.buttons[0].pressed) {
+        // animations.actions["attack-1"].setEffectiveTimeScale(5);
+        transitionTo("attack-1");
+      } else {
+        transitionTo("idle-1");
+      }
+      if (gamepad.buttons[2].pressed) {
+        animations.actions["attack-2"].play();
+      } else {
+        animations.actions["attack-2"].stop();
+        animations.actions["attack-2"].reset();
+      }
 
-        // Rotate character based on movement vector
-        if (movement.length() !== 0) {
-          const angle = Math.atan2(movement.x, movement.z);
-          const characterRotation = new THREE.Quaternion().setFromAxisAngle(
-            new THREE.Vector3(0, 1, 0),
-            angle
+      // MOVEMENT
+      const leftRight = gamepad.axes[0];
+      const forwardBack = -gamepad.axes[1];
+
+      // Calculate overall movement intensity
+      const intensity = Math.min(
+        1,
+        Math.sqrt(leftRight * leftRight + forwardBack * forwardBack)
+      );
+
+      updateMovementState(intensity);
+
+      // Smoothly interpolate current speed to target speed
+      currentSpeed.current = THREE.MathUtils.lerp(
+        currentSpeed.current,
+        targetSpeed.current,
+        delta * 5
+      );
+
+      if (
+        intensity > DEADZONE &&
+        controller.current &&
+        body.current &&
+        collider.current
+      ) {
+        try {
+          const position = vec3(body.current.translation());
+          const movement = vec3();
+
+          // Calculate target angle from stick input
+          const targetAngle = Math.atan2(leftRight, -forwardBack);
+          const currentRotation = ostrichRef.current.rotation.y;
+
+          // Calculate difference and normalize to -π to π
+          let angleDiff = targetAngle - currentRotation;
+          angleDiff = ((angleDiff + Math.PI) % (Math.PI * 2)) - Math.PI;
+
+          // Adjust turn speed based on movement intensity
+          const turnThreshold = Math.PI / 4;
+          const turnSpeed = 0.1 * Math.min(1, intensity * 1.5); // Slower turning at low intensity
+
+          if (Math.abs(angleDiff) > turnThreshold) {
+            // Large angle difference - focus on turning
+            ostrichRef.current.rotation.y += Math.sign(angleDiff) * turnSpeed;
+            movement.z = -forwardBack * 0.2;
+            movement.x = leftRight * 0.2;
+          } else {
+            movement.z = -forwardBack;
+            movement.x = leftRight;
+            ostrichRef.current.rotation.y += angleDiff * 0.1;
+          }
+
+          // Apply movement with current speed
+          movement.normalize().multiplyScalar(currentSpeed.current);
+
+          // Update collider movement
+          controller.current.computeColliderMovement(
+            collider.current,
+            movement
           );
-          ostrichRef.current.quaternion.slerp(characterRotation, 0.1); // character ie ostrich
+          let correctedMovement = controller.current.computedMovement();
+          position.add(vec3(correctedMovement));
+          body.current.setNextKinematicTranslation(position);
+        } catch (err) {
+          console.error("Movement error:", err);
         }
-
-        // Normalize and scale movement vector and set y component to -1
-        movement.normalize().multiplyScalar(0.1);
-        movement.y = -0.5;
-
-        // Update collider movement and get new position of rigid body
-        controller.current.computeColliderMovement(collider.current, movement);
-        let correctedMovement = controller.current.computedMovement();
-        position.add(vec3(correctedMovement));
-        body.current.setNextKinematicTranslation(position);
-      } catch (err) {}
-    }
-
-    // ANIMATION TRANSITIONS
-    // track how long key is held down for
-    // if longer than n move up to next animation
-    // if key no longer held transition to idle
-    if (forward || backward || leftward || rightward) {
-      animateFromIdle();
-    } else {
-      if (animationTime.current !== null) {
-        animateFromRun();
       }
     }
 
-    // CAMERA LOGIC
+    // Camera logic remains the same
     const ostrichPosition = body.current.translation();
 
     const cameraPosition = new THREE.Vector3();
@@ -182,17 +254,13 @@ export default function Ostrich() {
       canSleep={false}
       colliders={false}
       friction={1}
-      linearDamping={10} // Reduced from 10
-      angularDamping={10} // Reduced from 10
-      position={[0, 1, 0]} // Lower starting position
+      linearDamping={10}
+      angularDamping={10}
+      position={[0, 0, 0]}
       mass={1}
     >
       <primitive object={ostrich.scene} ref={ostrichRef} />
-      <CylinderCollider
-        args={[1, 0.3]} // Increased height (2 units total)
-        position={[0, 1, 0]} // Match RigidBody position
-        ref={collider}
-      />
+      <CylinderCollider args={[1, 0.3]} position={[0, 0, 0]} ref={collider} />
     </RigidBody>
   );
 }

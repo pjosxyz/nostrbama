@@ -13,19 +13,20 @@ export default function Experience() {
   useEffect(() => {
     window.addEventListener("gamepadconnected", (event) => {
       const gamepad = event.gamepad;
-      addGamepad(gamepad);
+      console.log(gamepad);
+      // addGamepad(gamepad);
     });
     window.addEventListener("gamepaddisconnected", (event) => {
       console.log("gamepad disconnected");
       const index = event.gamepad.index;
-      removeGamepad(index);
+      // removeGamepad(index);
     });
   }, []);
 
   return (
     <>
       <color args={["rebeccapurple"]} attach="background" />
-      <Physics>
+      <Physics debug>
         <Lights />
         <Player />
         <Logo />

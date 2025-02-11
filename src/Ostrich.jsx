@@ -6,14 +6,15 @@ import {
   CuboidCollider,
   useRapier,
   vec3,
+  TrimeshCollider,
 } from "@react-three/rapier";
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { KinematicCharacterController } from "@dimforge/rapier3d-compat";
 import { useGamepadStore } from "./stores/useGamePad";
+import { button } from "leva";
 
 export default function Ostrich() {
-  const ostrich = useGLTF("./nla_ostrich.glb");
+  const ostrich = useGLTF("./nla_ostrich--01_1k.glb");
   const animations = useAnimations(ostrich.animations, ostrich.scene);
   const [smoothedCameraPosition] = useState(
     () => new THREE.Vector3(10, 20, 10)
@@ -26,9 +27,16 @@ export default function Ostrich() {
   const collider = useRef();
   const body = useRef();
   const ostrichRef = useRef();
+  const beakBone = useRef();
+  const beakBody = useRef();
+  const beakCollider = useRef();
 
-  // Animation state
-  const currentAnimation = useRef("idle-1");
+  // animation mixer
+  let mixer = null;
+
+  // Updated animation state management
+  const baseAnimation = useRef("idle-1"); // Track base movement animation
+  const isAttacking = useRef(false);
   const currentSpeed = useRef(0);
   const targetSpeed = useRef(0);
 
@@ -41,76 +49,6 @@ export default function Ostrich() {
   const WALK_SPEED = 0.05;
   const RUN_SPEED = 0.15;
 
-  const transitionMap = {
-    "idle-1": {
-      walk: { fadeOut: 0.3, fadeIn: 0.5 },
-      run: { fadeOut: 0.2, fadeIn: 0.5 },
-      "attack-1": { fadeOut: 0.5, fadeIn: 0.2 },
-    },
-    walk: {
-      "idle-1": { fadeOut: 0.5, fadeIn: 0.3 },
-      run: { fadeOut: 0.3, fadeIn: 0.4 },
-      "attack-1": { fadeOut: 0.5, fadeIn: 0.2 },
-    },
-    run: {
-      "idle-1": { fadeOut: 0.5, fadeIn: 0.2 },
-      walk: { fadeOut: 0.5, fadeIn: 0.3 },
-      "attack-1": { fadeOut: 0.5, fadeIn: 0.2 },
-    },
-    "attack-1": {
-      "idle-1": { fadeOut: 0.5, fadeIn: 0.1 },
-      walk: { fadeOut: 0.5, fadeIn: 0.3 },
-      run: { fadeOut: 0.3, fadeIn: 0.4 },
-    },
-  };
-
-  function transitionTo(newAnimation, blendWeight = 1) {
-    const current = currentAnimation.current;
-    if (newAnimation === current) {
-      // Update weight of current animation
-      animations.actions[current].setEffectiveWeight(blendWeight);
-      return;
-    }
-
-    const transition = transitionMap[current][newAnimation];
-
-    // Fade out current animation
-    animations.actions[current].fadeOut(transition.fadeOut);
-
-    // Fade in new animation with specified weight
-    animations.actions[newAnimation].reset();
-    animations.actions[newAnimation].fadeIn(transition.fadeIn);
-    animations.actions[newAnimation].setEffectiveWeight(blendWeight);
-    animations.actions[newAnimation].play();
-
-    currentAnimation.current = newAnimation;
-  }
-
-  function updateMovementState(intensity) {
-    // Calculate movement speed based on intensity
-    if (intensity <= DEADZONE) {
-      transitionTo("idle-1");
-      targetSpeed.current = 0;
-    } else if (intensity <= WALK_THRESHOLD) {
-      // Map intensity to walk animation weight
-      const walkWeight = (intensity - DEADZONE) / (WALK_THRESHOLD - DEADZONE);
-      transitionTo("walk", walkWeight);
-      targetSpeed.current = WALK_SPEED * walkWeight;
-    } else if (intensity <= RUN_THRESHOLD) {
-      // Blend between walk and run
-      const runProgress =
-        (intensity - WALK_THRESHOLD) / (RUN_THRESHOLD - WALK_THRESHOLD);
-      transitionTo("run", runProgress);
-      targetSpeed.current = WALK_SPEED + (RUN_SPEED - WALK_SPEED) * runProgress;
-    } else {
-      // Full run
-      transitionTo("run");
-      const speedMultiplier =
-        1 + ((intensity - RUN_THRESHOLD) / (1 - RUN_THRESHOLD)) * 0.2; // Up to 20% faster
-      targetSpeed.current = RUN_SPEED * speedMultiplier;
-    }
-  }
-
   useEffect(() => {
     // Set up character controller
     const offsetFromGameWorld = 0.01;
@@ -120,55 +58,152 @@ export default function Ostrich() {
     char.enableSnapToGround(1);
     controller.current = char;
 
+    // Set up additive animation blending
+    const attack1 = animations.actions["attack-1"];
+    const attack2 = animations.actions["attack-2"];
+    if (attack1 && attack2) {
+      // attack1.setEffectiveTimeScale(3);
+      // attack2.setEffectiveTimeScale(3);
+    }
+
+    // Initialize base animations
+    Object.values(animations.actions).forEach((action) => {
+      if (action.getClip().name !== "attack-1") {
+        action.blendMode = THREE.NormalAnimationBlendMode;
+      }
+    });
+
     // Initialize idle animation
     const idleAction = animations.actions["idle-1"];
-    animations.actions["attack-1"].setEffectiveTimeScale(5);
     if (idleAction) {
       idleAction.play();
       idleAction.setEffectiveWeight(1);
     }
 
-    // Enable shadows for all meshes in the model
+    // Enable shadows for all meshes
     ostrich.scene.traverse((child) => {
       if (child.isMesh) {
         child.castShadow = true;
-        // Optionally, also make sure materials are set up for shadows
         if (child.material) {
           child.material.shadowSide = THREE.FrontSide;
         }
       }
     });
-  }, [rapier, animations, ostrich.scene]);
+
+    ostrich.scene.traverse((object) => {
+      if (object.isBone && object.name.toLowerCase().includes("tongue2")) {
+        beakBone.current = object;
+      }
+    });
+
+    mixer = new THREE.AnimationMixer(ostrich);
+    mixer.addEventListener("finished", handleAttackFinish);
+  }, [rapier, animations, ostrich.scene, mixer]);
+
+  function handleAttackFinish(event) {
+    console.log("anim finitio");
+    beakBody.current.setEnabled(false);
+  }
+
+  function updateMovementAnimation(newAnimation, blendWeight = 1) {
+    // Don't transition if we're already in this animation
+    if (newAnimation === baseAnimation.current) {
+      animations.actions[baseAnimation.current].setEffectiveWeight(blendWeight);
+      return;
+    }
+
+    // Fade out current base animation
+    animations.actions[baseAnimation.current].fadeOut(0.2);
+
+    // Fade in new base animation
+    animations.actions[newAnimation].reset();
+    animations.actions[newAnimation].fadeIn(0.2);
+    animations.actions[newAnimation].setEffectiveWeight(blendWeight);
+    animations.actions[newAnimation].play();
+
+    baseAnimation.current = newAnimation;
+  }
+
+  function handleAttack(buttonIndex) {
+    if (buttonIndex === 0 || buttonIndex === 2) {
+      let attack;
+      if (buttonIndex === 0) {
+        attack = animations.actions["attack-1"];
+      } else {
+        attack = animations.actions["attack-2"];
+      }
+      if (attack.isRunning()) return;
+      beakBody.current.setEnabled(true);
+      console.log(attack.mixer);
+      attack.mixer = mixer;
+      console.log(attack.mixer);
+      attack.loop = THREE.LoopOnce;
+      attack.reset();
+      attack.play();
+    }
+  }
+
+  function updateBeakCollider() {
+    if (beakBone.current && beakBody.current) {
+      // Get world position of beak bone
+      const worldPos = new THREE.Vector3();
+      beakBone.current.getWorldPosition(worldPos);
+
+      // Get world quaternion for rotation
+      const worldQuat = new THREE.Quaternion();
+      beakBone.current.getWorldQuaternion(worldQuat);
+
+      // Update beak rigid body position
+      beakBody.current.setNextKinematicTranslation(worldPos);
+      beakBody.current.setNextKinematicRotation(worldQuat);
+    }
+  }
 
   useFrame((state, delta) => {
     const gamepad = navigator.getGamepads()?.[0];
 
     if (gamepad) {
-      // ATTACK
-      if (gamepad.buttons[0].pressed) {
-        // animations.actions["attack-1"].setEffectiveTimeScale(5);
-        transitionTo("attack-1");
-      } else {
-        transitionTo("idle-1");
-      }
-      if (gamepad.buttons[2].pressed) {
-        animations.actions["attack-2"].play();
-      } else {
-        animations.actions["attack-2"].stop();
-        animations.actions["attack-2"].reset();
+      // Handle attack
+      // const pressedButtons = gamepad.buttons.filter((button) => button.pressed);
+      const pressedButtonIndex = gamepad.buttons.findIndex(
+        (button) => button.pressed
+      );
+      handleAttack(pressedButtonIndex);
+
+      if (beakBody.current.enabled) {
+        updateBeakCollider();
       }
 
       // MOVEMENT
       const leftRight = gamepad.axes[0];
       const forwardBack = -gamepad.axes[1];
 
-      // Calculate overall movement intensity
+      // Calculate movement intensity
       const intensity = Math.min(
         1,
         Math.sqrt(leftRight * leftRight + forwardBack * forwardBack)
       );
 
-      updateMovementState(intensity);
+      // Update movement animation state
+      if (intensity <= DEADZONE) {
+        updateMovementAnimation("idle-1");
+        targetSpeed.current = 0;
+      } else if (intensity <= WALK_THRESHOLD) {
+        const walkWeight = (intensity - DEADZONE) / (WALK_THRESHOLD - DEADZONE);
+        updateMovementAnimation("walk", walkWeight);
+        targetSpeed.current = WALK_SPEED * walkWeight;
+      } else if (intensity <= RUN_THRESHOLD) {
+        const runProgress =
+          (intensity - WALK_THRESHOLD) / (RUN_THRESHOLD - WALK_THRESHOLD);
+        updateMovementAnimation("run", runProgress);
+        targetSpeed.current =
+          WALK_SPEED + (RUN_SPEED - WALK_SPEED) * runProgress;
+      } else {
+        updateMovementAnimation("run");
+        const speedMultiplier =
+          1 + ((intensity - RUN_THRESHOLD) / (1 - RUN_THRESHOLD)) * 0.2;
+        targetSpeed.current = RUN_SPEED * speedMultiplier;
+      }
 
       // Smoothly interpolate current speed to target speed
       currentSpeed.current = THREE.MathUtils.lerp(
@@ -197,7 +232,7 @@ export default function Ostrich() {
 
           // Adjust turn speed based on movement intensity
           const turnThreshold = Math.PI / 4;
-          const turnSpeed = 0.1 * Math.min(1, intensity * 1.5); // Slower turning at low intensity
+          const turnSpeed = 0.1 * Math.min(1, intensity * 1.5);
 
           if (Math.abs(angleDiff) > turnThreshold) {
             // Large angle difference - focus on turning
@@ -227,40 +262,74 @@ export default function Ostrich() {
       }
     }
 
-    // Camera logic remains the same
+    // Camera logic
     const ostrichPosition = body.current.translation();
-
-    const cameraPosition = new THREE.Vector3();
-    cameraPosition.copy(ostrichPosition);
-    cameraPosition.z += 4.25;
-    cameraPosition.y += 7;
-    cameraPosition.x -= 4;
-
-    const cameraTarget = new THREE.Vector3();
-    cameraTarget.copy(ostrichPosition);
-    cameraTarget.y += 0.25;
-
-    smoothedCameraPosition.lerp(cameraPosition, 5 * delta);
-    smoothedCameraTarget.lerp(cameraTarget, 5 * delta);
-
-    state.camera.position.copy(smoothedCameraPosition);
-    state.camera.lookAt(smoothedCameraTarget);
+    cameraLogic(
+      state,
+      ostrichPosition,
+      smoothedCameraTarget,
+      smoothedCameraPosition,
+      delta
+    );
   });
 
   return (
-    <RigidBody
-      type="kinematicPosition"
-      ref={body}
-      canSleep={false}
-      colliders={false}
-      friction={1}
-      linearDamping={10}
-      angularDamping={10}
-      position={[0, 0, 0]}
-      mass={1}
-    >
-      <primitive object={ostrich.scene} ref={ostrichRef} />
-      <CylinderCollider args={[1, 0.3]} position={[0, 0, 0]} ref={collider} />
-    </RigidBody>
+    <>
+      <RigidBody
+        type="kinematicPosition"
+        ref={body}
+        canSleep={false}
+        colliders={false}
+        friction={1}
+        linearDamping={10}
+        angularDamping={10}
+        position={[0, 0, 0]}
+        mass={1}
+      >
+        <primitive object={ostrich.scene} ref={ostrichRef} />
+        <CylinderCollider
+          args={[1, 0.55]}
+          position={[0, 0, 0]}
+          ref={collider}
+        />
+      </RigidBody>
+      <RigidBody
+        type="kinematicPosition"
+        ref={beakBody}
+        canSleep={false}
+        enabled={false}
+        colliders={false}
+        sensor
+      >
+        <CuboidCollider
+          ref={beakCollider}
+          args={[0.1, 0.1, 0.2]} // Adjust size as needed
+        />
+      </RigidBody>
+    </>
   );
+}
+
+function cameraLogic(
+  state,
+  ostrichPosition,
+  smoothedCameraTarget,
+  smoothedCameraPosition,
+  delta
+) {
+  const cameraPosition = new THREE.Vector3();
+  cameraPosition.copy(ostrichPosition);
+  cameraPosition.z += 4.25;
+  cameraPosition.y += 7;
+  cameraPosition.x -= 4;
+
+  const cameraTarget = new THREE.Vector3();
+  cameraTarget.copy(ostrichPosition);
+  cameraTarget.y += 0.25;
+
+  smoothedCameraPosition.lerp(cameraPosition, 5 * delta);
+  smoothedCameraTarget.lerp(cameraTarget, 5 * delta);
+
+  state.camera.position.copy(smoothedCameraPosition);
+  state.camera.lookAt(smoothedCameraTarget);
 }

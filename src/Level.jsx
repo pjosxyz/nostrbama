@@ -61,12 +61,12 @@ export default function Level() {
         />
       </RigidBody>
       <RefCubes />
-      <RigidBody type="dynamic" colliders="cuboid">
+      {/* <RigidBody type="dynamic" colliders="cuboid">
         <mesh receiveShadow>
           <boxGeometry args={[2, 2, 2]} position={[0, 1, 0]} />
           <meshStandardMaterial color={'orangered'} />
         </mesh>
-      </RigidBody>
+      </RigidBody> */}
     </>
   );
 }
